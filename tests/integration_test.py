@@ -103,12 +103,12 @@ class HttpTests(unittest.TestCase):
     def test_z_multi_admin_account_creation_and_permissions(self):
         _,content,_=self.request('/api/login','POST',{'username':'admin','password':'ChangeMe123!'})
         owner_token=json.loads(content)['token']
-        status,content,_=self.request('/api/users','POST',{'username':'second_admin','display_name':'Second Admin','password':'SecurePassword123','role':'admin','skills':[],'shift_start':'09:00','shift_end':'18:00'},owner_token)
+        status,content,_=self.request('/api/users','POST',{'username':'second_admin','display_name':'Second Admin','password':'SecurePass123!','role':'admin','skills':[],'shift_start':'09:00','shift_end':'18:00'},owner_token)
         self.assertEqual(status,201)
         users=json.loads(self.request('/api/users',token=owner_token)[1])['users']
         new_admin=next(u for u in users if u['username']=='second_admin')
         self.assertEqual(new_admin['role'],'admin')
-        _,content,_=self.request('/api/login','POST',{'username':'second_admin','password':'SecurePassword123'})
+        _,content,_=self.request('/api/login','POST',{'username':'second_admin','password':'SecurePass123!'})
         second_token=json.loads(content)['token']
         self.assertEqual(self.request('/api/users',token=second_token)[0],200)
         _,content,_=self.request('/api/login','POST',{'username':'operator1','password':'Welcome123!'})
@@ -119,6 +119,26 @@ class HttpTests(unittest.TestCase):
         html=open(os.path.join(ROOT,'static','index.html'),encoding='utf-8').read()
         self.assertIn('name="role" id="userRole"',html)
         self.assertIn('管理者権限も付与',html)
+    def test_password_policy_on_creation_and_change(self):
+        _,content,_=self.request('/api/login','POST',{'username':'admin','password':'ChangeMe123!'})
+        token=json.loads(content)['token']
+        base={'username':'pw_policy_user','display_name':'Password Policy User','role':'operator','skills':['Consumer'],'shift_start':'09:00','shift_end':'18:00'}
+        for password in ('abcdefg1', 'Abcdefghijklmnop1!', 'Abcdefgh', '12345678'):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.request('/api/users','POST',{**base,'password':password},token=token)
+            self.assertEqual(ctx.exception.code,400)
+        status,content,_=self.request('/api/users','POST',{**base,'password':'GoodPass1!'},token=token)
+        self.assertEqual(status,201)
+        _,content,_=self.request('/api/login','POST',{'username':'pw_policy_user','password':'GoodPass1!'})
+        user_token=json.loads(content)['token']
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request('/api/password','POST',{'old_password':'GoodPass1!','new_password':'abcdefgh1'},token=user_token)
+        self.assertEqual(ctx.exception.code,400)
+        status,content,_=self.request('/api/password','POST',{'old_password':'GoodPass1!','new_password':'StrongPass1!'},token=user_token)
+        self.assertEqual(status,200)
+        html=open(os.path.join(ROOT,'static','index.html'),encoding='utf-8').read()
+        self.assertIn('data-toggle-password',html)
+        self.assertIn('maxlength="16"',html)
     def test_wrong_password_fails(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx: self.request('/api/login','POST',{'username':'admin','password':'incorrect'})
         self.assertEqual(ctx.exception.code,401)

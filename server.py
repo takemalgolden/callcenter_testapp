@@ -37,6 +37,20 @@ def hash_password(password, salt=None):
 def verify_password(password, salt, digest):
     return hmac.compare_digest(hash_password(password, salt)[1], digest)
 
+def valid_password(password):
+    """Require 8-16 chars and at least three of uppercase/lowercase/digit/symbol."""
+    if not isinstance(password, str) or not 8 <= len(password) <= 16:
+        return False
+    categories = (
+        any('A' <= c <= 'Z' for c in password),
+        any('a' <= c <= 'z' for c in password),
+        any('0' <= c <= '9' for c in password),
+        any(not (('A' <= c <= 'Z') or ('a' <= c <= 'z') or ('0' <= c <= '9')) for c in password),
+    )
+    return sum(categories) >= 3
+
+PASSWORD_RULE_MESSAGE = 'パスワードは8〜16文字で、大文字・小文字・数字・記号の4種類のうち3種類以上を含めてください。'
+
 def emit(kind='update'):
     with EVENT_LOCK:
         EVENTS.append({'id': time.time_ns(), 'kind': kind, 'time': time.time()})
@@ -442,8 +456,8 @@ class Handler(BaseHTTPRequestHandler):
             actor=self.require()
             if not actor:return
             old=str(data.get('old_password','')); new=str(data.get('new_password',''))
-            if len(new)<12:
-                self.send_json({'error':'新しいパスワードは12文字以上にしてください。'},400); return
+            if not valid_password(new):
+                self.send_json({'error':PASSWORD_RULE_MESSAGE},400); return
             con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(actor['id'],)).fetchone()
             if not row or not verify_password(old,row['salt'],row['password_hash']):
                 con.close(); self.send_json({'error':'現在のパスワードが違います。'},403); return
@@ -487,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
             if not actor:return
             username=str(data.get('username','')).strip(); name=str(data.get('display_name','')).strip(); role=data.get('role','operator')
             skills=data.get('skills',[]); start=data.get('shift_start','09:00'); end=data.get('shift_end','18:00'); password=str(data.get('password',''))
-            if not username or not name or role not in ('admin','operator') or not password or len(password)<10 or not isinstance(skills,list) or any(s not in SKILLS for s in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end): self.send_json({'error':'入力を確認してください。パスワードは10文字以上です。'},400); return
+            if not username or not name or role not in ('admin','operator') or not valid_password(password) or not isinstance(skills,list) or any(s not in SKILLS for s in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end): self.send_json({'error':('入力を確認してください。' if valid_password(password) else PASSWORD_RULE_MESSAGE)},400); return
             salt,digest=hash_password(password)
             try:
                 con=db(); cur=con.execute('INSERT INTO users(username,display_name,role,salt,password_hash,skills,shift_start,shift_end) VALUES(?,?,?,?,?,?,?,?)',(username,name,role,salt,digest,json.dumps(skills),start,end)); con.commit(); uid=cur.lastrowid; con.close()
@@ -580,8 +594,8 @@ class Handler(BaseHTTPRequestHandler):
                 audit(actor['id'],'user_activated' if data['active'] else 'user_deactivated',{'user_id':uid}); emit('users'); self.send_json({'ok':True}); return
             username=str(data.get('username','')).strip(); name=str(data.get('display_name','')).strip(); skills=data.get('skills',[])
             start=data.get('shift_start','09:00'); end=data.get('shift_end','18:00'); password=str(data.get('password',''))
-            if not username or not name or not isinstance(skills,list) or any(x not in SKILLS for x in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end) or (password and len(password)<10):
-                con.close(); self.send_json({'error':'入力を確認してください。勤務時間は10分刻み、終了は開始より後、変更するパスワードは10文字以上です。'},400); return
+            if not username or not name or not isinstance(skills,list) or any(x not in SKILLS for x in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end) or (password and not valid_password(password)):
+                con.close(); self.send_json({'error':(PASSWORD_RULE_MESSAGE if password and not valid_password(password) else '入力を確認してください。勤務時間は10分刻み、終了は開始より後です。')},400); return
             try:
                 if password:
                     salt,digest=hash_password(password)
