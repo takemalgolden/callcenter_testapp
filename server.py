@@ -508,6 +508,20 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         try: data=self.body()
         except Exception as e: self.send_json({'error':'不正なリクエストです。'},400); return
+        if path=='/api/register':
+            # Public self-registration is always an inactive operator until an admin approves it.
+            username=str(data.get('username','')).strip(); name=str(data.get('display_name','')).strip()
+            password=data.get('password',''); skills=data.get('skills',[])
+            start=data.get('shift_start','09:00'); end=data.get('shift_end','18:00')
+            if not username or len(username)>100 or not name or len(name)>100 or not valid_password(password) or not isinstance(skills,list) or not skills or any(x not in SKILLS for x in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end):
+                self.send_json({'error':'登録情報を確認してください。パスワードは8〜16文字・3種類以上の文字種が必要です。'},400); return
+            salt,digest=hash_password(password)
+            try:
+                con=db(); cur=con.execute('INSERT INTO users(username,display_name,role,salt,password_hash,skills,shift_start,shift_end,active) VALUES(?,?,?,?,?,?,?,?,0)',(username,name,'operator',salt,digest,json.dumps(skills),start,end)); con.commit(); uid=cur.lastrowid; con.close()
+            except sqlite3.IntegrityError:
+                self.send_json({'error':'このユーザー名は既に使われています。'},409); return
+            audit(None,'operator_registration_requested',{'user_id':uid}); emit('users')
+            self.send_json({'ok':True,'message':'登録申請を受け付けました。管理者の承認後にログインできます。'},201); return
         if path=='/api/login':
             username=str(data.get('username',''))[:100]; password=str(data.get('password',''))
             con=db(); row=con.execute('SELECT * FROM users WHERE username=? AND active=1',(username,)).fetchone(); con.close()
@@ -701,6 +715,9 @@ class Handler(BaseHTTPRequestHandler):
                 if uid==actor['id'] and not bool(data['active']): con.close(); self.send_json({'error':'自分自身を無効化できません。'},400); return
                 con.execute('UPDATE users SET active=? WHERE id=?',(1 if data['active'] else 0,uid)); con.commit(); con.close()
                 audit(actor['id'],'user_activated' if data['active'] else 'user_deactivated',{'user_id':uid}); emit('users'); self.send_json({'ok':True}); return
+            role=data.get('role',row['role'])
+            if role not in ('operator','admin') or (uid==actor['id'] and role!='admin'):
+                con.close(); self.send_json({'error':'権限の変更が許可されません。'},400); return
             username=str(data.get('username','')).strip(); name=str(data.get('display_name','')).strip(); skills=data.get('skills',[])
             start=data.get('shift_start','09:00'); end=data.get('shift_end','18:00'); password=str(data.get('password',''))
             if not username or not name or not isinstance(skills,list) or any(x not in SKILLS for x in skills) or not valid_time(start) or not valid_time(end) or mins(start)>=mins(end) or (password and not valid_password(password)):
@@ -708,12 +725,17 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if password:
                     salt,digest=hash_password(password)
-                    con.execute('UPDATE users SET username=?,display_name=?,skills=?,shift_start=?,shift_end=?,salt=?,password_hash=? WHERE id=?',(username,name,json.dumps(skills),start,end,salt,digest,uid))
+                    con.execute('UPDATE users SET username=?,display_name=?,role=?,skills=?,shift_start=?,shift_end=?,salt=?,password_hash=? WHERE id=?',(username,name,role,json.dumps(skills),start,end,salt,digest,uid))
                 else:
-                    con.execute('UPDATE users SET username=?,display_name=?,skills=?,shift_start=?,shift_end=? WHERE id=?',(username,name,json.dumps(skills),start,end,uid))
+                    con.execute('UPDATE users SET username=?,display_name=?,role=?,skills=?,shift_start=?,shift_end=? WHERE id=?',(username,name,role,json.dumps(skills),start,end,uid))
                 con.commit(); con.close()
             except sqlite3.IntegrityError:
                 con.close(); self.send_json({'error':'このユーザー名は既に使われています。'},409); return
+            
+            if row['role']!=role:
+                for key,session in list(SESSIONS.items()):
+                    if session['user_id']==uid: SESSIONS.pop(key,None)
+                audit(actor['id'],'user_role_changed',{'user_id':uid,'old_role':row['role'],'new_role':role})
             audit(actor['id'],'user_updated',{'user_id':uid}); emit('users'); self.send_json({'ok':True}); return
         if path.startswith('/api/demand/'):
             actor=self.require(admin=True)
