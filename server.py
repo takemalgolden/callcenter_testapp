@@ -2,7 +2,8 @@
 """Call Center Local Scheduler - standard-library LAN server with SQLite."""
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-import json, sqlite3, os, secrets, hashlib, hmac, time, threading, socket, sys, base64, tempfile
+import json, sqlite3, os, secrets, hashlib, hmac, time, threading, socket, sys, base64, tempfile, csv, io, zipfile, re
+import xml.etree.ElementTree as ET
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
@@ -355,6 +356,72 @@ def find_shortages(users, slots, req, occupied):
             if have<req[s][skill]: out.append({'time':hhmm(s),'skill':skill,'required':req[s][skill],'eligible_available':have})
     return out[:30]
 
+def parse_employee_file(filename, payload):
+    """Read first worksheet from .xlsx or CSV, no external dependencies."""
+    if len(payload)>2_000_000: raise ValueError('ファイルは2MB以下にしてください。')
+    lower=filename.lower()
+    if lower.endswith('.csv'):
+        content=None
+        for encoding in ('utf-8-sig','cp932'):
+            try: content=payload.decode(encoding); break
+            except UnicodeDecodeError: pass
+        if content is None: raise ValueError('CSVの文字コードを読み取れません。')
+        rows=list(csv.reader(io.StringIO(content)))
+    elif lower.endswith('.xlsx'):
+        ns={'m':'http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'r':'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as z:
+                if len(z.namelist())>1500 or sum(i.file_size for i in z.infolist())>20_000_000: raise ValueError('Excelファイルが大きすぎます。')
+                shared=[]
+                if 'xl/sharedStrings.xml' in z.namelist():
+                    root=ET.fromstring(z.read('xl/sharedStrings.xml'))
+                    shared=[''.join(t.text or '' for t in si.findall('.//m:t',ns)) for si in root.findall('m:si',ns)]
+                root=ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+                rows=[]
+                for r in root.findall('.//m:sheetData/m:row',ns):
+                    values={}
+                    for c in r.findall('m:c',ns):
+                        ref=c.get('r',''); m=re.match(r'[A-Z]+',ref)
+                        if not m:continue
+                        col=0
+                        for letter in m.group():col=col*26+ord(letter)-64
+                        if col>30:continue
+                        v=c.find('m:v',ns)
+                        if c.get('t')=='inlineStr': value=''.join(x.text or '' for x in c.findall('.//m:t',ns))
+                        elif v is None:value=''
+                        elif c.get('t')=='s':value=shared[int(v.text)]
+                        else:value=v.text or ''
+                        values[col-1]=value
+                    rows.append([values.get(i,'') for i in range(max(values.keys(),default=-1)+1)])
+        except (zipfile.BadZipFile,KeyError,ET.ParseError,IndexError,TypeError) as e: raise ValueError('Excelファイルを読み取れません。1枚目のシートを確認してください。') from e
+    else: raise ValueError('対応形式は .xlsx または .csv です。')
+    rows=[r for r in rows if any(str(v).strip() for v in r)]
+    if not rows:raise ValueError('ファイルにデータがありません。')
+    headers=[str(x).strip().lstrip('\ufeff') for x in rows[0]]
+    aliases={'ユーザー名':'username','ログインID':'username','username':'username','表示名':'display_name','氏名':'display_name','display_name':'display_name','パスワード':'password','password':'password','スキル':'skills','対応スキル':'skills','skills':'skills','勤務開始':'shift_start','shift_start':'shift_start','勤務終了':'shift_end','shift_end':'shift_end'}
+    mapped=[aliases.get(h) for h in headers]
+    if len(set(x for x in mapped if x))!=len([x for x in mapped if x]):raise ValueError('重複する列名があります。')
+    required={'username','display_name','password','skills','shift_start','shift_end'}
+    if not required.issubset(set(mapped)):raise ValueError('必須列：ユーザー名、表示名、パスワード、スキル、勤務開始、勤務終了')
+    if len(rows)-1>300:raise ValueError('一度に登録できるのは300人までです。')
+    employees=[]; errors=[]; seen=set()
+    for idx,row in enumerate(rows[1:],start=2):
+        record={key:str(row[i]).strip() if i<len(row) else '' for i,key in enumerate(mapped) if key}
+        username=record['username']; name=record['display_name']; password=record['password']
+        skilltext=record['skills'].replace('、',',').replace('／',',').replace('/',',').replace(';',',')
+        skills=[x.strip() for x in skilltext.split(',') if x.strip()]
+        start=record['shift_start']; end=record['shift_end']
+        if not username or not name or len(username)>100 or len(name)>100: errors.append(f'{idx}行目：ユーザー名・表示名を確認してください。')
+        if username in seen:errors.append(f'{idx}行目：ファイル内でユーザー名が重複しています。')
+        seen.add(username)
+        if not valid_password(password):errors.append(f'{idx}行目：パスワードの条件を満たしていません。')
+        if not skills or len(skills)!=len(set(skills)) or any(x not in SKILLS for x in skills):errors.append(f'{idx}行目：スキルは Consumer, Merchant, PP をカンマ区切りで指定してください。')
+        if not valid_time(start) or not valid_time(end) or (valid_time(start) and valid_time(end) and mins(start)>=mins(end)):errors.append(f'{idx}行目：勤務時刻を10分刻みで正しく指定してください。')
+        employees.append((username,name,password,skills,start,end))
+    if not employees:raise ValueError('登録対象がありません。')
+    if errors:raise ValueError('\n'.join(errors[:15]))
+    return employees
+
 class Handler(BaseHTTPRequestHandler):
     server_version='CallCenterLocal/1.0'
     def log_message(self, fmt, *args):
@@ -496,6 +563,32 @@ class Handler(BaseHTTPRequestHandler):
             con.backup(target); target.commit(); payload=target.serialize(); target.close(); con.close()
             self.send_response(200); self.send_header('Content-Type','application/octet-stream'); self.send_header('Content-Disposition','attachment; filename=callcenter-backup.sqlite3'); self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload)
             audit(actor['id'],'database_backup'); return
+        if path=='/api/users/import':
+            actor=self.require(admin=True)
+            if not actor:return
+            try:
+                filename=str(data.get('filename',''))
+                encoded=str(data.get('file_base64',''))
+                if len(encoded)>2_700_000:raise ValueError('ファイルは2MB以下にしてください。')
+                payload=base64.b64decode(encoded,validate=True)
+                employees=parse_employee_file(filename,payload)
+                con=db()
+                try:
+                    con.execute('BEGIN IMMEDIATE')
+                    names=[u[0] for u in employees]
+                    existing={r['username'] for r in con.execute('SELECT username FROM users WHERE username IN ('+','.join('?' for _ in names)+')',names)}
+                    if existing:raise ValueError('登録済みユーザー名：'+', '.join(sorted(existing)[:10]))
+                    for username,name,password,skills,start,end in employees:
+                        salt,digest=hash_password(password)
+                        con.execute('INSERT INTO users(username,display_name,role,salt,password_hash,skills,shift_start,shift_end) VALUES(?,?,?,?,?,?,?,?)',(username,name,'operator',salt,digest,json.dumps(skills),start,end))
+                    con.commit()
+                except Exception:
+                    con.rollback();raise
+                finally:con.close()
+                audit(actor['id'],'operators_imported',{'count':len(employees)})
+                emit('users');self.send_json({'ok':True,'created':len(employees)},201)
+            except (ValueError,sqlite3.IntegrityError,base64.binascii.Error) as e:self.send_json({'error':str(e)},400)
+            return
         if path=='/api/users':
             actor=self.require(admin=True)
             if not actor:return
@@ -581,6 +674,22 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         try: data=self.body()
         except Exception: self.send_json({'error':'不正なリクエストです。'},400); return
+        if path.startswith('/api/users/') and path.endswith('/reset-password'):
+            actor=self.require(admin=True)
+            if not actor: return
+            try: uid=int(path.split('/')[3])
+            except (ValueError, IndexError): self.send_json({'error':'ユーザーIDが不正です。'},400); return
+            password=data.get('new_password')
+            if not valid_password(password): self.send_json({'error':PASSWORD_RULE_MESSAGE},400); return
+            con=db(); row=con.execute('SELECT id,role FROM users WHERE id=? AND active=1',(uid,)).fetchone()
+            if not row or row['role']!='operator':
+                con.close(); self.send_json({'error':'有効なオペレーターが見つかりません。'},404); return
+            salt,digest=hash_password(password)
+            con.execute('UPDATE users SET salt=?,password_hash=? WHERE id=?',(salt,digest,uid)); con.commit(); con.close()
+            for key, session in list(SESSIONS.items()):
+                if session['user_id']==uid: SESSIONS.pop(key,None)
+            audit(actor['id'],'operator_password_reset',{'user_id':uid}); emit('users')
+            self.send_json({'ok':True}); return
         if path.startswith('/api/users/'):
             actor=self.require(admin=True)
             if not actor:return
